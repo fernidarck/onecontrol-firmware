@@ -11,7 +11,7 @@
 #include <Preferences.h>
 
 const char* mqtt_server = "187.124.146.232";
-const char* supabaseUrl = "https://vxvrrmtiexpmaqnscydv.supabase.co/rest/v1/devices?chip_id=eq.";
+const char* supabaseUrl = "https://vxvrrmtiexpmaqnscydv.supabase.co/rest/v1/devices?select=last_command&chip_id=eq.";
 const char* supabaseKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZ4dnJybXRpZXhwbWFxbnNjeWR2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc2Njg2NjQsImV4cCI6MjA5MzI0NDY2NH0.Hl3AXIXDkwGQlc5zOeVdVH0g64KIFYDvpP0xeORZ0uE";
 
 #define SERVICE_UUID     "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
@@ -40,6 +40,7 @@ bool bleNeedsAdvertising = false;
 
 unsigned long lastSupabaseCheck = 0;
 unsigned long lastMqttAttempt   = 0;
+unsigned long lastWifiCheck     = 0;
 
 // ── Acciones ──────────────────────────────────────────────
 void abrirAccion(String source) {
@@ -72,38 +73,59 @@ void reconnectMQTT() {
   }
 }
 
+// ── WiFi reconexión ───────────────────────────────────────
+void checkWifi() {
+  if (savedSSID == "") return;
+  if (millis() - lastWifiCheck < 30000) return;
+  lastWifiCheck = millis();
+  int st = WiFi.status();
+  if (st == WL_CONNECTED) return;
+  if (st != WL_DISCONNECTED && st != WL_CONNECT_FAILED) return;
+  Serial.println("WiFi reconectando (status=" + String(st) + ")...");
+  WiFi.disconnect(true);
+  delay(200);
+  WiFi.begin(savedSSID.c_str(), savedPASS.c_str());
+}
+
 // ── Supabase ──────────────────────────────────────────────
 void checkSupabase() {
   if (millis() - lastSupabaseCheck < 5000) return;
   lastSupabaseCheck = millis();
 
   String url = String(supabaseUrl) + chipIdStr;
-  NetworkClientSecure sc;
-  sc.setInsecure();
+  NetworkClientSecure* sc = new NetworkClientSecure();
+  sc->setInsecure();
   HTTPClient http;
-  http.begin(sc, url);
+  http.begin(*sc, url);
   http.addHeader("apikey", supabaseKey);
   http.addHeader("Authorization", "Bearer " + String(supabaseKey));
 
   int code = http.GET();
+  Serial.println("Supabase GET: " + String(code));
   if (code == 200) {
-    DynamicJsonDocument doc(512);
-    if (!deserializeJson(doc, http.getString()) && doc.size() > 0 && doc[0]["last_command"] == "open") {
+    String body = http.getString();
+    DynamicJsonDocument doc(1024);
+    DeserializationError err = deserializeJson(doc, body);
+    if (err) {
+      Serial.println("JSON error: " + String(err.c_str()));
+    } else if (doc.size() > 0 && doc[0]["last_command"] == "open") {
       abrirAccion("App");
-      NetworkClientSecure sc2; sc2.setInsecure();
+      String patchUrl = "https://vxvrrmtiexpmaqnscydv.supabase.co/rest/v1/devices?chip_id=eq." + chipIdStr;
+      NetworkClientSecure* sc2 = new NetworkClientSecure();
+      sc2->setInsecure();
       HTTPClient patch;
-      patch.begin(sc2, url);
+      patch.begin(*sc2, patchUrl);
       patch.addHeader("apikey", supabaseKey);
       patch.addHeader("Authorization", "Bearer " + String(supabaseKey));
       patch.addHeader("Content-Type", "application/json");
       patch.addHeader("Prefer", "return=minimal");
       patch.PATCH("{\"last_command\": null}");
       patch.end();
+      delete sc2;
     }
-  } else {
-    Serial.println("Supabase HTTP: " + String(code));
   }
   http.end();
+  delete sc;
 }
 
 // ── BLE Callbacks ─────────────────────────────────────────
@@ -148,7 +170,6 @@ void setup() {
   Serial.begin(115200);
   pinMode(relayPin, OUTPUT); pinMode(ledInterno, OUTPUT);
   digitalWrite(relayPin, HIGH);
-
   uint64_t chipid = ESP.getEfuseMac();
   char id_buffer[17];
   sprintf(id_buffer, "%04X%08X", (uint16_t)(chipid >> 32), (uint32_t)chipid);
@@ -194,6 +215,7 @@ void setup() {
   if (savedSSID != "") {
     Serial.println("Conectando a WiFi: " + savedSSID);
     WiFi.begin(savedSSID.c_str(), savedPASS.c_str());
+    lastWifiCheck = millis(); // evita que checkWifi interrumpa la conexión inicial
     client.setServer(mqtt_server, 1883);
     client.setCallback(mqttCallback);
   } else {
@@ -211,10 +233,16 @@ void loop() {
     Serial.println("BLE: anunciando de nuevo.");
   }
 
+  checkWifi();
+  static bool wifiPrinted = false;
+  if (WiFi.status() == WL_CONNECTED && !wifiPrinted) {
+    wifiPrinted = true;
+    Serial.println("WiFi OK. IP: " + WiFi.localIP().toString());
+  }
+  if (!wifiPrinted) wifiPrinted = false; // reset si cae
   if (WiFi.status() == WL_CONNECTED) {
     reconnectMQTT();
     client.loop();
-    checkSupabase();
   }
 
   char key = keypad.getKey();

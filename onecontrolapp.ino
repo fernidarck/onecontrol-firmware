@@ -25,8 +25,10 @@ byte rowPins[ROWS] = {13, 12, 14, 27};
 byte colPins[COLS]  = {26, 25, 33};
 Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
-const int relayPin   = 4;
-const int ledInterno = 2;
+const int relayPin      = 4;
+const int ledInterno    = 2;
+const int PIN_SENSOR    = 32;
+
 WiFiClient espClient;
 PubSubClient client(espClient);
 Preferences preferences;
@@ -41,6 +43,11 @@ bool bleNeedsAdvertising = false;
 unsigned long lastSupabaseCheck = 0;
 unsigned long lastMqttAttempt   = 0;
 unsigned long lastWifiCheck     = 0;
+
+// ── Sensor imán ───────────────────────────────────────────
+int  sensorEstadoAnterior = -1;
+unsigned long sensorDebounceTime = 0;
+int  sensorLecturaPendiente = -1;
 
 // ── Acciones ──────────────────────────────────────────────
 void abrirAccion(String source) {
@@ -170,6 +177,7 @@ void setup() {
   Serial.begin(115200);
   pinMode(relayPin, OUTPUT); pinMode(ledInterno, OUTPUT);
   digitalWrite(relayPin, HIGH);
+  pinMode(PIN_SENSOR, INPUT_PULLUP);
   uint64_t chipid = ESP.getEfuseMac();
   char id_buffer[17];
   sprintf(id_buffer, "%04X%08X", (uint16_t)(chipid >> 32), (uint32_t)chipid);
@@ -243,6 +251,22 @@ void loop() {
   if (WiFi.status() == WL_CONNECTED) {
     reconnectMQTT();
     client.loop();
+  }
+
+  // ── Sensor imán con debounce ──────────────────────────
+  int lectura = digitalRead(PIN_SENSOR);
+  if (lectura != sensorEstadoAnterior) {
+    if (lectura != sensorLecturaPendiente) {
+      sensorLecturaPendiente = lectura;
+      sensorDebounceTime = millis();
+    } else if (millis() - sensorDebounceTime > 200) {
+      sensorEstadoAnterior = lectura;
+      bool cerrado = (lectura == LOW);
+      String estado = cerrado ? "cerrado" : "abierto";
+      String topic = "onecontrol/" + chipIdStr + "/estado";
+      if (client.connected()) client.publish(topic.c_str(), estado.c_str(), true);
+      Serial.println("Sensor: " + estado);
+    }
   }
 
   char key = keypad.getKey();
